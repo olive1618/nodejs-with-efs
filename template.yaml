@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: NodeJS lambda with mounted EFS
+
+Parameters:
+  EfsMountPath:
+    Type: String
+    Default: /mnt/efs
+  LambdaFunctionName:
+    Type: String
+    Default: hello-world-node-with-efs
+  S3DeployArtifactBucketName:
+    Type: String
+
+Resources:
+  MountTargetVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsHostnames: True
+      EnableDnsSupport: True      
+ 
+  MountTargetSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 172.31.1.0/24
+      VpcId: !Ref MountTargetVPC
+      AvailabilityZone: "us-west-2a"
+
+  MountTargetSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 172.31.2.0/24
+      VpcId: !Ref MountTargetVPC
+      AvailabilityZone: "us-west-2b"
+
+  MountTargetSubnetThree:
+    Type: AWS::EC2::Subnet
+    Properties:
+      CidrBlock: 172.31.3.0/24
+      VpcId: !Ref MountTargetVPC
+      AvailabilityZone: "us-west-2c"
+ 
+  FileSystemResource:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: generalPurpose
+      Encrypted: true
+      FileSystemPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "elasticfilesystem:ClientMount"
+            Principal:
+              AWS: "*"
+
+  MountTargetResource1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      SubnetId: !Ref MountTargetSubnetOne
+      SecurityGroups:
+      - !GetAtt MountTargetVPC.DefaultSecurityGroup
+
+  MountTargetResource2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      SubnetId: !Ref MountTargetSubnetTwo
+      SecurityGroups:
+      - !GetAtt MountTargetVPC.DefaultSecurityGroup
+
+  MountTargetResource3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      SubnetId: !Ref MountTargetSubnetThree
+      SecurityGroups:
+      - !GetAtt MountTargetVPC.DefaultSecurityGroup
+ 
+  AccessPointResource:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystemResource
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: "1000"
+          OwnerUid: "1000"
+          Permissions: "0777"
+        Path: !Ref EfsMountPath
+
+  HelloWorldFunction:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - MountTargetResource1
+      - MountTargetResource2
+      - MountTargetResource3
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      CodeUri: hello-world/
+      Handler: app.lambdaHandler
+      Runtime: nodejs12.x
+      VpcConfig:
+        SecurityGroupIds: !GetAtt MountTargetVPC.DefaultSecurityGroup
+        SubnetIds:
+          - !Ref MountTargetSubnetOne
+          - !Ref MountTargetSubnetTwo
+          - !Ref MountTargetSubnetThree
+      FileSystemConfigs:
+      - Arn: !GetAtt AccessPointResource.Arn  # EFS access point
+        LocalMountPath: !Ref EfsMountPath     # Path at which EFS is mounted in Lambda function
+      Policies:
+      - Statement:
+        - Sid: AWSLambdaVPCAccessExecutionRole
+          Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - ec2:CreateNetworkInterface
+            - ec2:DescribeNetworkInterfaces
+            - ec2:DeleteNetworkInterface
+          Resource: "*"
+        - Sid: AmazonElasticFileSystemClientFullAccess
+          Effect: Allow
+          Action:
+            - elasticfilesystem:ClientMount
+            - elasticfilesystem:ClientRootAccess
+            - elasticfilesystem:ClientWrite
+            - elasticfilesystem:DescribeMountTargets
+          Resource: "*"
+
+  DataSyncS3AccessRole:
+    Type: AWS::IAM::Role
+    Description: Role datasync assumes to access s3
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-DataSyncS3AccessRole"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - datasync.amazonaws.com
+            Action: "sts:AssumeRole"
+
+  DataSyncS3AccessRolePolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - DataSyncS3AccessRole
+    Description: IAM policy used by datasync to access S3
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-DataSyncS3AccessRolePolicy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetBucketLocation
+          - s3:ListBucket
+          - s3:ListBucketMultipartUploads
+          Resource:
+          - !Sub "s3://${S3DeployArtifactBucketName}"
+        - Effect: Allow
+          Action:
+          - s3:AbortMultipartUpload
+          - s3:DeleteObject
+          - s3:GetObject
+          - s3:ListMultipartUploadParts
+          - s3:GetObjectTagging
+          - s3:PutObjectTagging
+          - s3:PutObject
+          Resource:
+          - !Sub "s3://${S3DeployArtifactBucketName}/*"
+      Roles:
+        - !Ref DataSyncS3AccessRole
+
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref MountTargetVPC
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-vpc
+  VpcSecurityGroupId:
+    Description: VPC default security group Id
+    Value: !GetAtt MountTargetVPC.DefaultSecurityGroup
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-vpc-sg-id
+  SubnetOneId:
+    Description: Private Subnet A ID
+    Value: !Ref MountTargetSubnetOne
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-subnet-one-id
+  SubnetTwoId:
+    Description: Private Subnet B ID
+    Value: !Ref MountTargetSubnetTwo
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-subnet-two-id
+  SubnetThreeId:
+    Description: Subnet three ID
+    Value: !Ref MountTargetSubnetThree
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-subnet-three-id
+  EfsFileSystemArn:
+    Description: EFS file system ARN
+    Value: !GetAtt FileSystemResource.Arn
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-efs-filesystem-arn
+  MountTargetOne:
+    Description: Mount target one ID
+    Value: !Ref MountTargetResource1
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-efs-mount-target-one-id
+  MountTargetTwo:
+    Description: Mount target two ID
+    Value: !Ref MountTargetResource2
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-efs-mount-target-two-id
+  MountTargetThree:
+    Description: Mount target three ID
+    Value: !Ref MountTargetResource3
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-efs-mount-target-three-id
+  EfsAccessPointArn:
+    Description: Access point ARN
+    Value: !GetAtt AccessPointResource.Arn
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-efs-access-point-arn
+  EfsAccessPointArn:
+    Description: DataSync S3 access role ARN
+    Value: !GetAtt DataSyncS3AccessRole.Arn
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-ds-s3-access-role-arn
